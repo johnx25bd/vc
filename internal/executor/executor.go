@@ -405,6 +405,9 @@ type Config struct {
 	// Control server configuration (vc-00cu)
 	EnableControlServer bool   // Enable control server for pause/resume commands (default: true)
 	ControlSocketPath   string // Path to control socket (default: ".vc/executor.sock")
+
+	// AI Backend configuration (vc-dtqf: Claude Code CLI backend)
+	AIBackend ai.BackendType // AI backend type (default: anthropic-sdk, or from VC_AI_BACKEND env var)
 }
 
 // Validate checks the configuration for invalid combinations (vc-q5ve)
@@ -631,6 +634,7 @@ func New(cfg *Config) (*Executor, error) {
 		supervisor, err := ai.NewSupervisor(&ai.Config{
 			Store:       cfg.Store,
 			CostTracker: costTracker, // Pass cost tracker to supervisor (vc-e3s7)
+			Backend:     cfg.AIBackend, // Backend type (vc-dtqf: claude-code support)
 		})
 		if err != nil {
 			// Don't fail - just disable AI supervision

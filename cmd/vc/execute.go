@@ -13,6 +13,7 @@ import (
 
 	"github.com/fatih/color"
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/vc/internal/ai"
 	"github.com/steveyegge/vc/internal/config"
 	"github.com/steveyegge/vc/internal/deduplication"
 	"github.com/steveyegge/vc/internal/executor"
@@ -64,6 +65,7 @@ func runExecutor(cmd *cobra.Command) error {
 	issueID, _ := cmd.Flags().GetString("issue")
 	stdinFlag, _ := cmd.Flags().GetBool("stdin")
 	liteMode, _ := cmd.Flags().GetBool("lite")
+	useClaudeCode, _ := cmd.Flags().GetBool("use-claude-code")
 
 	// Determine execution mode
 	var mode types.ExecutionMode
@@ -216,6 +218,10 @@ func runExecutor(cmd *cobra.Command) error {
 	cfg.EnableAutoPR = enableAutoPR         // vc-389e: expose auto-PR configuration
 	if pollSeconds > 0 {
 		cfg.PollInterval = time.Duration(pollSeconds) * time.Second
+	}
+	// AI backend configuration (vc-dtqf)
+	if useClaudeCode {
+		cfg.AIBackend = ai.BackendClaudeCode
 	}
 
 	// Warn if sandboxes are disabled (vc-144)
@@ -420,6 +426,9 @@ func init() {
 	executeCmd.Flags().String("issue", "", "Beads issue ID to load as task for polecat mode")
 	executeCmd.Flags().Bool("stdin", false, "Read task description from stdin (supports piping and heredocs)")
 	executeCmd.Flags().Bool("lite", false, "Skip preflight and assessment for fast trivial tasks (requires --polecat-mode)")
+
+	// AI backend flags (vc-dtqf: Claude Code CLI backend support)
+	executeCmd.Flags().Bool("use-claude-code", false, "Use Claude Code CLI for AI supervision (uses subscription instead of API key, can also set VC_AI_BACKEND=claude-code)")
 
 	rootCmd.AddCommand(executeCmd)
 }

@@ -47,6 +47,16 @@ func GetSimpleTaskModel() string {
 	return ModelHaiku
 }
 
+// BackendType represents the type of AI backend to use
+type BackendType string
+
+const (
+	// BackendAnthropicSDK uses the Anthropic SDK directly (requires API key)
+	BackendAnthropicSDK BackendType = "anthropic-sdk"
+	// BackendClaudeCode uses the Claude Code CLI (uses subscription)
+	BackendClaudeCode BackendType = "claude-code"
+)
+
 // Supervisor handles AI-powered assessment and analysis of issues
 // It also implements the MissionPlanner interface for mission orchestration
 //
@@ -63,6 +73,7 @@ func GetSimpleTaskModel() string {
 // - utils.go: Shared utilities (logging, summarization, truncation)
 type Supervisor struct {
 	client         *anthropic.Client
+	backend        AIBackend           // Pluggable AI backend (vc-dtqf)
 	store          storage.Storage
 	model          string
 	retry          RetryConfig
@@ -90,25 +101,19 @@ type CostTracker interface {
 
 // Config holds supervisor configuration
 type Config struct {
-	APIKey      string       // Anthropic API key (if empty, reads from ANTHROPIC_API_KEY env var)
-	Model       string       // Model to use (default: claude-sonnet-4-5-20250929)
+	APIKey      string          // Anthropic API key (if empty, reads from ANTHROPIC_API_KEY env var)
+	Model       string          // Model to use (default: claude-sonnet-4-5-20250929)
 	Store       storage.Storage
-	Retry       RetryConfig  // Retry configuration (uses defaults if not specified)
-	CostTracker CostTracker  // Optional cost tracker for budget enforcement (vc-e3s7)
+	Retry       RetryConfig     // Retry configuration (uses defaults if not specified)
+	CostTracker CostTracker     // Optional cost tracker for budget enforcement (vc-e3s7)
+	Backend     BackendType     // AI backend type (default: anthropic-sdk, or from VC_AI_BACKEND env var)
+	CLIPath     string          // Path to claude CLI (only used when Backend is claude-code)
 }
 
 // NewSupervisor creates a new AI supervisor
 func NewSupervisor(cfg *Config) (*Supervisor, error) {
 	if cfg.Store == nil {
 		return nil, fmt.Errorf("storage is required")
-	}
-
-	apiKey := cfg.APIKey
-	if apiKey == "" {
-		apiKey = os.Getenv("ANTHROPIC_API_KEY")
-		if apiKey == "" {
-			return nil, fmt.Errorf("ANTHROPIC_API_KEY not set")
-		}
 	}
 
 	model := cfg.Model
@@ -122,7 +127,61 @@ func NewSupervisor(cfg *Config) (*Supervisor, error) {
 		retry = DefaultRetryConfig()
 	}
 
-	client := anthropic.NewClient(option.WithAPIKey(apiKey))
+	// Determine backend type from config or environment
+	backendType := cfg.Backend
+	if backendType == "" {
+		if envBackend := os.Getenv("VC_AI_BACKEND"); envBackend != "" {
+			backendType = BackendType(envBackend)
+		} else {
+			backendType = BackendAnthropicSDK // Default to SDK
+		}
+	}
+
+	// Create the appropriate backend
+	var backend AIBackend
+	var client *anthropic.Client
+
+	switch backendType {
+	case BackendClaudeCode:
+		// Create Claude Code CLI backend
+		cliBackend, err := NewClaudeCodeCLIBackend(&ClaudeCodeBackendConfig{
+			Model:   model,
+			CLIPath: cfg.CLIPath,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to create Claude Code backend: %w", err)
+		}
+		backend = cliBackend
+		fmt.Printf("AI backend initialized: claude-code (model=%s)\n", model)
+
+	case BackendAnthropicSDK, "": // Default to SDK
+		// Get API key for SDK backend
+		apiKey := cfg.APIKey
+		if apiKey == "" {
+			apiKey = os.Getenv("ANTHROPIC_API_KEY")
+			if apiKey == "" {
+				return nil, fmt.Errorf("ANTHROPIC_API_KEY not set (required for anthropic-sdk backend)")
+			}
+		}
+
+		// Create SDK backend
+		sdkBackend, err := NewAnthropicSDKBackend(&AnthropicBackendConfig{
+			APIKey: apiKey,
+			Model:  model,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to create Anthropic SDK backend: %w", err)
+		}
+		backend = sdkBackend
+
+		// Also create the raw client for backward compatibility with CallAPI
+		rawClient := anthropic.NewClient(option.WithAPIKey(apiKey))
+		client = &rawClient
+		fmt.Printf("AI backend initialized: anthropic-sdk (model=%s)\n", model)
+
+	default:
+		return nil, fmt.Errorf("unknown backend type: %s (valid options: anthropic-sdk, claude-code)", backendType)
+	}
 
 	// Initialize circuit breaker if enabled
 	var circuitBreaker *CircuitBreaker
@@ -144,7 +203,8 @@ func NewSupervisor(cfg *Config) (*Supervisor, error) {
 	}
 
 	return &Supervisor{
-		client:         &client,
+		client:         client, // May be nil if using Claude Code backend
+		backend:        backend,
 		store:          cfg.Store,
 		model:          model,
 		retry:          retry,
@@ -174,12 +234,55 @@ func (s *Supervisor) HealthCheck(ctx context.Context) error {
 	return nil
 }
 
+// CompleteWithBackend executes a completion using the configured AI backend.
+// This is the preferred method for new code - it uses the pluggable backend
+// and handles retry, circuit breaker, and concurrency limiting.
+//
+// Returns the response text.
+func (s *Supervisor) CompleteWithBackend(ctx context.Context, prompt string, opts CompletionOptions) (string, error) {
+	if opts.Model == "" {
+		opts.Model = s.model
+	}
+	if opts.MaxTokens == 0 {
+		opts.MaxTokens = 4096
+	}
+
+	var responseText string
+	err := s.retryWithBackoff(ctx, opts.Operation, func(attemptCtx context.Context) error {
+		text, backendErr := s.backend.Complete(attemptCtx, prompt, opts)
+		if backendErr != nil {
+			return backendErr
+		}
+		responseText = text
+		return nil
+	})
+
+	if err != nil {
+		return "", fmt.Errorf("%s failed: %w", opts.Operation, err)
+	}
+
+	return responseText, nil
+}
+
+// GetBackend returns the configured AI backend
+func (s *Supervisor) GetBackend() AIBackend {
+	return s.backend
+}
+
 // CallAPI makes a raw API call to the Anthropic API with the given prompt.
 // This is a low-level method for use by specialized components that need
 // direct access to the API (e.g., convergence detection).
 //
+// DEPRECATED: Use CompleteWithBackend for new code. This method requires the
+// Anthropic SDK backend and will not work with Claude Code CLI backend.
+//
 // Use the higher-level methods (Assess, Analyze, etc.) for standard workflows.
 func (s *Supervisor) CallAPI(ctx context.Context, prompt string, model string, maxTokens int) (*anthropic.Message, error) {
+	// Check if we have a raw client (SDK backend)
+	if s.client == nil {
+		return nil, fmt.Errorf("CallAPI requires anthropic-sdk backend (client is nil)")
+	}
+
 	if model == "" {
 		model = s.model
 	}
